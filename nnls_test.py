@@ -37,17 +37,28 @@ if uploaded_file is not None:
             if any(price < 0 for price in p):
                 st.warning("Some items have negative estimated prices, which should not happen with non-negative least squares. This may indicate numerical instability or an issue with the dataset.")
             
+            # Function to format price based on its value
+            def format_price(price, item_name):
+                if price < 0.001:
+                    scaled_price = price * 1000
+                    return f"${scaled_price:.2f} (1k {item_name})"
+                elif price < 0.01:
+                    scaled_price = price * 100
+                    return f"${scaled_price:.2f} (100 {item_name})"
+                else:
+                    return f"${price:.2f}"
+            
             # Create tabs
             tab1, tab2 = st.tabs(["Bundle Analysis", "Item Prices"])
             
-            # Tab 1: Bundle Analysis (existing functionality)
+            # Tab 1: Bundle Analysis
             with tab1:
                 # Dropdown menu to select an item
                 selected_item = st.selectbox("Select an item", item_names)
                 p_i = p[item_names.index(selected_item)]  # Estimated price of the selected item
                 
-                # Display the estimated price
-                st.write(f"Estimated price of {selected_item}: ${p_i:.2f}")
+                # Display the estimated price with scaling if necessary
+                st.write(f"Estimated price of {selected_item}: {format_price(p_i, selected_item)}")
                 
                 # Warn if the estimated price is zero
                 if p_i == 0:
@@ -94,11 +105,21 @@ if uploaded_file is not None:
             
             # Tab 2: Item Prices
             with tab2:
-                # Create a DataFrame for item prices
-                item_price_df = pd.DataFrame({
-                    'Item': item_names,
-                    'Estimated Price ($)': [round(price, 2) for price in p]
-                })
+                # Create a DataFrame for item prices with scaled prices
+                item_price_data = []
+                for item, price in zip(item_names, p):
+                    if price < 0.001:
+                        scaled_price = price * 1000
+                        display_price = f"${scaled_price:.2f} (1k)"
+                    elif price < 0.01:
+                        scaled_price = price * 100
+                        display_price = f"${scaled_price:.2f} (100)"
+                    else:
+                        scaled_price = price
+                        display_price = f"${scaled_price:.2f}"
+                    item_price_data.append({'Item': item, 'Estimated Price ($)': display_price})
+                
+                item_price_df = pd.DataFrame(item_price_data)
                 
                 # Display a sortable table of items and their estimated prices
                 st.dataframe(item_price_df, use_container_width=True)
