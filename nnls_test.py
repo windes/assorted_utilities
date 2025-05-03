@@ -53,23 +53,26 @@ if uploaded_file is not None:
                 effective_cost = c_sub - sum_other  # Effective cost of selected item
                 effective_cost_per_unit = effective_cost / bundles_with_item[selected_item]
                 
-                # Add effective cost per unit to the DataFrame
-                bundles_with_item['effective_cost_per_unit'] = effective_cost_per_unit
+                # Calculate effective units per $1 (reciprocal of effective cost per unit)
+                effective_units_per_dollar = 1 / effective_cost_per_unit
                 
-                # Sort bundles by effective cost per unit (ascending = best value first)
-                sorted_bundles = bundles_with_item.sort_values('effective_cost_per_unit')
+                # Add effective units per $1 to the DataFrame
+                bundles_with_item['effective_units_per_dollar'] = effective_units_per_dollar
+                
+                # Sort bundles by effective units per dollar (descending = best value first)
+                sorted_bundles = bundles_with_item.sort_values('effective_units_per_dollar', ascending=False)
                 
                 # Prepare display DataFrame with renamed columns for clarity
-                display_df = sorted_bundles[['bundle_name', 'cost', selected_item, 'effective_cost_per_unit']]
+                display_df = sorted_bundles[['bundle_name', 'cost', selected_item, 'effective_units_per_dollar']]
                 display_df = display_df.rename(columns={
                     'bundle_name': 'Bundle Name',
                     'cost': 'Bundle Cost',
                     selected_item: 'Quantity',
-                    'effective_cost_per_unit': 'Effective Cost per Unit'
+                    'effective_units_per_dollar': 'Effective Units per $1'
                 })
                 
-                # Round the effective cost for better readability
-                display_df['Effective Cost per Unit'] = display_df['Effective Cost per Unit'].round(2)
+                # Round the effective units per $1 for better readability
+                display_df['Effective Units per $1'] = display_df['Effective Units per $1'].round(2)
                 
                 # Display the sorted list of bundles
                 st.dataframe(display_df)
