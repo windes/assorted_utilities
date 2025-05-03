@@ -26,12 +26,23 @@ if uploaded_file is not None:
         elif not all(df[col].dtype.kind in 'biufc' for col in item_names + ['cost']):
             st.error("Item quantities and costs must be numeric.")
         else:
-            # Prepare data for non-negative least squares
+            # Prepare data for non-negative least squares with regularization
             A = df[item_names].values  # Matrix of item quantities (bundles x items)
             c = df['cost'].values      # Vector of bundle costs
+            n_items = len(item_names)
+            
+            # Add L2 regularization: minimize ||A @ p - c||^2 + lambda * ||p||^2
+            lambda_reg = 0.1  # Regularization parameter
+            A_reg = np.vstack([A, np.sqrt(lambda_reg) * np.eye(n_items)])
+            c_reg = np.concatenate([c, np.zeros(n_items)])
             
             # Solve for individual item prices using non-negative least squares
-            p, _ = nnls(A, c)
+            p, _ = nnls(A_reg, c_reg)
+            
+            # Normalize prices to better match total bundle costs
+            predicted_costs = A @ p
+            scaling_factor = np.mean(c / predicted_costs[predicted_costs > 0])
+            p = p * scaling_factor
             
             # Check for negative prices and warn the user
             if any(price < 0 for price in p):
