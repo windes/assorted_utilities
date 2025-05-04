@@ -4,3 +4,4 @@ numpy
 scipy
 pymc
 arviz
+numba
