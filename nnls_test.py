@@ -39,10 +39,10 @@ def run_bayesian_model(bundle_data, trade_data):
             if give_item in item_index and receive_item in item_index:
                 trades.append((item_index[give_item], give_qty, item_index[receive_item], receive_qty))
     
-    # Build and fit Bayesian model
+    # Build Bayesian model
     with pm.Model() as model:
-        # Item values (non-negative prior with adjusted scale)
-        p = pm.HalfNormal('p', sigma=0.5, shape=len(item_names))
+        # Item values (use LogNormal prior for better sampling)
+        p = pm.LogNormal('p', mu=0, sigma=1, shape=len(item_names))
         
         # Bundle price likelihood
         sigma_bundle = pm.HalfNormal('sigma_bundle', sigma=1)
@@ -56,16 +56,10 @@ def run_bayesian_model(bundle_data, trade_data):
                 trade_pred = receive_qty * p[receive_idx]
                 pm.Normal(f'trade_{give_idx}_{receive_idx}', mu=trade_pred, sigma=sigma_trade, observed=give_qty * p[give_idx])
     
-    # Fit the model with optimized parameters
+    # Fit the model using variational inference
     with model:
-        trace = pm.sample(
-            draws=500,  # Reduced from 1000
-            tune=500,   # Reduced from 1000
-            chains=2,
-            cores=1,
-            target_accept=0.9,  # Increased to reduce divergences
-            return_inferencedata=True
-        )
+        inference = pm.fit(n=20000, method='advi', random_seed=42)  # 20,000 iterations for ADVI
+        trace = inference.sample(draws=1000)  # Draw samples from the fitted approximation
     
     # Extract mean item prices
     p_mean = trace.posterior['p'].mean(dim=['chain', 'draw']).values
@@ -96,7 +90,7 @@ if bundle_file is not None:
                     trade_data = df_trade.to_dict('records')
             
             # Run the Bayesian model (cached)
-            with st.spinner("Running Bayesian model..."):
+            with st.spinner("Estimating item prices using Bayesian model..."):
                 item_names, p_mean, df_bundle = run_bayesian_model(
                     bundle_data=df_bundle.to_dict('records'),
                     trade_data=trade_data
