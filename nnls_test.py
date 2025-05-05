@@ -93,19 +93,25 @@ if uploaded_file is not None:
                 problem = cp.Problem(cp.Minimize(objective), constraints)
                 try:
                     problem.solve(solver=cp.SCS, eps=1e-5)  # Use SCS solver with relaxed tolerance
-                    if problem.status != cp.OPTIMAL:
-                        st.warning("Optimization did not converge to an optimal solution. Results may be unreliable.")
-                    p_values = p.value
+                    if problem.status == cp.OPTIMAL:
+                        p_values = p.value
+                        # Clip to non-negative to handle numerical precision issues
+                        p_values = np.maximum(p_values, 0)
+                    else:
+                        st.warning("Optimization did not converge to an optimal solution. Falling back to NNLS.")
+                        p_values = None
                 except Exception as e:
                     st.error(f"Optimization failed: {str(e)}. Falling back to bundle data only.")
                     p_values = None
                 
-                # If optimization fails, fall back to regularized NNLS
+                # If optimization fails or did not converge, fall back to regularized NNLS
                 if p_values is None:
                     from scipy.optimize import nnls
                     A_reg = np.vstack([A_scaled, np.sqrt(lambda_reg) * np.eye(n_items)])
                     c_reg = np.concatenate([c, np.zeros(n_items)])
                     p_values, _ = nnls(A_reg, c_reg)
+                    # NNLS ensures non-negative values, but clip for consistency
+                    p_values = np.maximum(p_values, 0)
                 
                 # Rescale the prices
                 p_values = p_values * p_scaling
@@ -117,9 +123,9 @@ if uploaded_file is not None:
                     scaling_factor = np.mean(c[nonzero_mask] / predicted_costs[nonzero_mask])
                     p_values = p_values * scaling_factor
                 
-                # Check for negative prices and warn the user
+                # Check for negative prices and warn the user (should not occur with clipping)
                 if any(price < 0 for price in p_values):
-                    st.warning("Some items have negative estimated prices, which should not happen. This may indicate numerical instability or an issue with the dataset.")
+                    st.warning("Some items have negative estimated prices after processing, which should not happen.")
                 
                 # Function to format price based on its value
                 def format_price(price, item_name):
