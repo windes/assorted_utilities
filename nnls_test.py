@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pymc as pm
+import cvxpy as cp
 
 # Set the title of the Streamlit app
 st.title("Bundle Value Calculator")
@@ -33,16 +33,15 @@ if uploaded_file is not None:
             elif not all(df_bundles[col].dtype.kind in 'biufc' for col in item_names + ['cost']):
                 st.error("Item quantities and costs in bundle sheet must be numeric.")
             else:
-                # Prepare data for Bayesian modeling
+                # Prepare data for optimization
                 A = df_bundles[item_names].values  # Matrix of item quantities (bundles x items)
                 c = df_bundles['cost'].values      # Vector of bundle costs
                 n_items = len(item_names)
                 
-                # Scale the quantities to improve numerical stability
+                # Scale the item quantities to improve numerical stability
                 scaling_factors = np.max(np.abs(A), axis=0)
                 scaling_factors[scaling_factors == 0] = 1  # Avoid division by zero
                 A_scaled = A / scaling_factors
-                c_scaled = c / np.max(np.abs(c))  # Scale costs as well
                 p_scaling = scaling_factors  # To rescale prices later
                 
                 # Read trade data from the second sheet, if it exists
@@ -64,32 +63,63 @@ if uploaded_file is not None:
                             else:
                                 st.warning(f"Trade involving {row['give_item']} or {row['receive_item']} ignored: Items not found in bundle data.")
                 
-                # Set up the Bayesian model with PyMC
-                with st.spinner("Fitting the model using variational inference..."):
-                    with pm.Model() as model:
-                        # Priors for item values
-                        p = pm.HalfNormal('p', sigma=1.0, shape=n_items)
-                        
-                        # Likelihood for bundle prices
-                        expected_cost = pm.math.dot(A_scaled, p)
-                        sigma = pm.HalfNormal('sigma', sigma=0.1)
-                        pm.Normal('bundle_obs', mu=expected_cost, sigma=sigma, observed=c_scaled)
-                        
-                        # Add trade likelihoods
-                        for trade in trades:
-                            give_idx = item_names.index(trade['give_item'])
-                            receive_idx = item_names.index(trade['receive_item'])
-                            give_qty = trade['give_quantity'] / scaling_factors[give_idx]
-                            receive_qty = trade['receive_quantity'] / scaling_factors[receive_idx]
-                            trade_sigma = pm.HalfNormal(f'trade_sigma_{trade["give_item"]}_{trade["receive_item"]}', sigma=0.01)
-                            pm.Normal(f'trade_obs_{trade["give_item"]}_{trade["receive_item"]}', mu=give_qty * p[give_idx] - receive_qty * p[receive_idx], sigma=trade_sigma, observed=0)
-                        
-                        # Use variational inference instead of MCMC
-                        approx = pm.fit(n=30000, method='advi', random_seed=42)
-                        p_mean = approx.mean.eval()  # Extract the mean of the variational posterior
+                # Set up the optimization problem with cvxpy
+                p = cp.Variable(n_items)  # Item prices (scaled)
+                lambda_reg = 0.1  # Regularization parameter
+                lambda_trade = 1.0  # Trade constraint penalty
+                
+                # Objective: ||A @ p - c||^2 + lambda_reg * ||p||^2
+                objective = cp.sum_squares(A_scaled @ p - c) + lambda_reg * cp.sum_squares(p)
+                
+                # Add soft trade constraints as penalty terms
+                if trades:
+                    trade_penalties = []
+                    for trade in trades:
+                        give_idx = item_names.index(trade['give_item'])
+                        receive_idx = item_names.index(trade['receive_item'])
+                        # Scale the quantities
+                        give_qty = trade['give_quantity'] / scaling_factors[give_idx]
+                        receive_qty = trade['receive_quantity'] / scaling_factors[receive_idx]
+                        # Penalty: (give_quantity * p[give_item] - receive_quantity * p[receive_item])^2
+                        penalty = cp.sum_squares(give_qty * p[give_idx] - receive_qty * p[receive_idx])
+                        trade_penalties.append(penalty)
+                    if trade_penalties:
+                        objective += lambda_trade * cp.sum(trade_penalties)
+                
+                # Constraints: p >= 0
+                constraints = [p >= 0]
+                
+                # Solve the problem
+                problem = cp.Problem(cp.Minimize(objective), constraints)
+                try:
+                    problem.solve(solver=cp.SCS, eps=1e-5)  # Use SCS solver with relaxed tolerance
+                    if problem.status != cp.OPTIMAL:
+                        st.warning("Optimization did not converge to an optimal solution. Results may be unreliable.")
+                    p_values = p.value
+                except Exception as e:
+                    st.error(f"Optimization failed: {str(e)}. Falling back to bundle data only.")
+                    p_values = None
+                
+                # If optimization fails, fall back to regularized NNLS
+                if p_values is None:
+                    from scipy.optimize import nnls
+                    A_reg = np.vstack([A_scaled, np.sqrt(lambda_reg) * np.eye(n_items)])
+                    c_reg = np.concatenate([c, np.zeros(n_items)])
+                    p_values, _ = nnls(A_reg, c_reg)
                 
                 # Rescale the prices
-                p_mean = p_mean * p_scaling / np.max(np.abs(c)) * np.max(np.abs(c_scaled))
+                p_values = p_values * p_scaling
+                
+                # Normalize prices to better match total bundle costs
+                predicted_costs = A @ p_values
+                nonzero_mask = predicted_costs > 0
+                if np.any(nonzero_mask):
+                    scaling_factor = np.mean(c[nonzero_mask] / predicted_costs[nonzero_mask])
+                    p_values = p_values * scaling_factor
+                
+                # Check for negative prices and warn the user
+                if any(price < 0 for price in p_values):
+                    st.warning("Some items have negative estimated prices, which should not happen. This may indicate numerical instability or an issue with the dataset.")
                 
                 # Function to format price based on its value
                 def format_price(price, item_name):
@@ -109,7 +139,7 @@ if uploaded_file is not None:
                 with tab1:
                     # Dropdown menu to select an item
                     selected_item = st.selectbox("Select an item", item_names)
-                    p_i = p_mean[item_names.index(selected_item)]  # Estimated price of the selected item
+                    p_i = p_values[item_names.index(selected_item)]  # Estimated price of the selected item
                     
                     # Display the estimated price with scaling if necessary
                     st.write(f"Estimated price of {selected_item}: {format_price(p_i, selected_item)}")
@@ -125,7 +155,7 @@ if uploaded_file is not None:
                         # Compute effective cost per unit for the selected item in each bundle
                         A_sub = bundles_with_item[item_names].values
                         c_sub = bundles_with_item['cost'].values
-                        sum_all = A_sub @ p_mean  # Total estimated cost of all items in each bundle
+                        sum_all = A_sub @ p_values  # Total estimated cost of all items in each bundle
                         sum_selected = bundles_with_item[selected_item] * p_i  # Estimated cost of selected item
                         sum_other = sum_all - sum_selected  # Estimated cost of other items
                         effective_cost = c_sub - sum_other  # Effective cost of selected item
@@ -158,10 +188,10 @@ if uploaded_file is not None:
                         st.write("No bundles contain this item.")
                 
                 # Tab 2: Item Prices
-                with tab1:
+                with tab2:
                     # Create a DataFrame for item prices with scaled prices
                     item_price_data = []
-                    for item, price in zip(item_names, p_mean):
+                    for item, price in zip(item_names, p_values):
                         if price < 0.001:
                             scaled_price = price * 1000
                             display_price = f"${scaled_price:.2f} (1k)"
@@ -188,7 +218,7 @@ if uploaded_file is not None:
                     for item in item_names:
                         quantity = bundle_row[item]
                         if quantity > 0:
-                            item_value = quantity * p_mean[item_names.index(item)]
+                            item_value = quantity * p_values[item_names.index(item)]
                             total_estimated_value += item_value
                             item_data.append({
                                 'Item': item,
