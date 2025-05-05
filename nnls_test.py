@@ -1,108 +1,107 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import pymc as pm
-import arviz as az
-import pytensor
+import cvxpy as cp
 
-# Configure PyTensor to use Numba backend for BLAS optimizations
-pytensor.config.mode = 'NUMBA'
-
-# Set the app title
+# Set the title of the Streamlit app
 st.title("Bundle Value Calculator")
 
-# File uploader for bundle CSV (required)
-bundle_file = st.file_uploader("Upload Bundle CSV file", type="csv")
+# File uploader for Excel (.xlsx) input
+uploaded_file = st.file_uploader("Upload Excel (.xlsx) file", type="xlsx")
 
-# File uploader for trade CSV (optional)
-trade_file = st.file_uploader("Upload Trade CSV file (optional)", type="csv")
-
-# Cache the Bayesian model results based on input data
-@st.cache_data
-def run_bayesian_model(bundle_data, trade_data):
-    # Prepare bundle data
-    df_bundle = pd.DataFrame(bundle_data)
-    item_names = [col for col in df_bundle.columns if col not in ['bundle_name', 'cost']]
-    A = df_bundle[item_names].values
-    c = df_bundle['cost'].values
+if uploaded_file is not None:
+    # Read the Excel file
+    xls = pd.ExcelFile(uploaded_file)
+    sheet_names = xls.sheet_names
     
-    # Prepare trade data
-    trades = []
-    if trade_data is not None:
-        df_trade = pd.DataFrame(trade_data)
-        item_index = {item: idx for idx, item in enumerate(item_names)}
-        for _, row in df_trade.iterrows():
-            give_item = row['give_item']
-            give_qty = row['give_quantity']
-            receive_item = row['receive_item']
-            receive_qty = row['receive_quantity']
-            if give_item in item_index and receive_item in item_index:
-                trades.append((item_index[give_item], give_qty, item_index[receive_item], receive_qty))
-    
-    # Build Bayesian model
-    with pm.Model() as model:
-        # Item values (use LogNormal prior for better sampling)
-        p = pm.LogNormal('p', mu=0, sigma=1, shape=len(item_names))
-        
-        # Bundle price likelihood
-        sigma_bundle = pm.HalfNormal('sigma_bundle', sigma=1)
-        bundle_pred = pm.math.dot(A, p)
-        pm.Normal('bundle_obs', mu=bundle_pred, sigma=sigma_bundle, observed=c)
-        
-        # Trade likelihood (if trade data exists)
-        if trades:
-            sigma_trade = pm.HalfNormal('sigma_trade', sigma=1)
-            for give_idx, give_qty, receive_idx, receive_qty in trades:
-                trade_pred = receive_qty * p[receive_idx]
-                pm.Normal(f'trade_{give_idx}_{receive_idx}', mu=trade_pred, sigma=sigma_trade, observed=give_qty * p[give_idx])
-    
-    # Fit the model using variational inference
-    with model:
-        inference = pm.fit(n=20000, method='advi', random_seed=42)  # 20,000 iterations for ADVI
-        trace = inference.sample(draws=1000)  # Draw samples from the fitted approximation
-    
-    # Extract mean item prices
-    p_mean = trace.posterior['p'].mean(dim=['chain', 'draw']).values
-    return item_names, p_mean, df_bundle
-
-if bundle_file is not None:
-    # Load bundle data
-    df_bundle = pd.read_csv(bundle_file)
-    
-    # Check for required columns
-    if 'bundle_name' not in df_bundle.columns or 'cost' not in df_bundle.columns:
-        st.error("Bundle CSV must have 'bundle_name' and 'cost' columns.")
+    # Read the bundle data from the first sheet
+    if len(sheet_names) < 1:
+        st.error("Excel file must contain at least one sheet with bundle data.")
     else:
-        # Validate bundle data
-        item_names = [col for col in df_bundle.columns if col not in ['bundle_name', 'cost']]
-        if len(item_names) == 0:
-            st.error("Bundle CSV must have at least one item column.")
-        elif not all(df_bundle[col].dtype.kind in 'biufc' for col in item_names + ['cost']):
-            st.error("Item quantities and costs must be numeric.")
+        df_bundles = pd.read_excel(uploaded_file, sheet_name=sheet_names[0])
+        
+        # Validate required columns in bundle data
+        if 'bundle_name' not in df_bundles.columns or 'cost' not in df_bundles.columns:
+            st.error("Bundle sheet must contain 'bundle_name' and 'cost' columns.")
         else:
-            # Load trade data if provided
-            trade_data = None
-            if trade_file is not None:
-                df_trade = pd.read_csv(trade_file)
-                if not all(col in df_trade.columns for col in ['give_item', 'give_quantity', 'receive_item', 'receive_quantity']):
-                    st.error("Trade CSV must have 'give_item', 'give_quantity', 'receive_item', and 'receive_quantity' columns.")
-                else:
-                    trade_data = df_trade.to_dict('records')
+            # Extract item names (all columns except 'bundle_name' and 'cost')
+            item_names = [col for col in df_bundles.columns if col not in ['bundle_name', 'cost']]
             
-            # Run the Bayesian model (cached)
-            with st.spinner("Estimating item prices using Bayesian model..."):
-                item_names, p_mean, df_bundle = run_bayesian_model(
-                    bundle_data=df_bundle.to_dict('records'),
-                    trade_data=trade_data
-                )
-            
-            # Create tabs for analysis
-            tab1, tab2 = st.tabs(["Bundle Analysis", "Item Prices"])
-            
-            # Tab 1: Bundle Analysis
-            with tab1:
-                selected_item = st.selectbox("Select an item", item_names)
-                p_i = p_mean[item_names.index(selected_item)]
+            # Validate that there is at least one item column and all relevant columns are numeric
+            if len(item_names) == 0:
+                st.error("Bundle sheet must contain at least one item column.")
+            elif not all(df_bundles[col].dtype.kind in 'biufc' for col in item_names + ['cost']):
+                st.error("Item quantities and costs in bundle sheet must be numeric.")
+            else:
+                # Prepare data for optimization
+                A = df_bundles[item_names].values  # Matrix of item quantities (bundles x items)
+                c = df_bundles['cost'].values      # Vector of bundle costs
+                n_items = len(item_names)
+                
+                # Read trade data from the second sheet, if it exists
+                trades = []
+                if len(sheet_names) > 1:
+                    df_trades = pd.read_excel(uploaded_file, sheet_name=sheet_names[1])
+                    required_trade_cols = ['give_item', 'give_quantity', 'receive_item', 'receive_quantity']
+                    if not all(col in df_trades.columns for col in required_trade_cols):
+                        st.warning("Trades sheet must contain 'give_item', 'give_quantity', 'receive_item', and 'receive_quantity' columns. Ignoring trade data.")
+                    else:
+                        for _, row in df_trades.iterrows():
+                            if row['give_item'] in item_names and row['receive_item'] in item_names:
+                                trades.append({
+                                    'give_item': row['give_item'],
+                                    'give_quantity': row['give_quantity'],
+                                    'receive_item': row['receive_item'],
+                                    'receive_quantity': row['receive_quantity']
+                                })
+                            else:
+                                st.warning(f"Trade involving {row['give_item']} or {row['receive_item']} ignored: Items not found in bundle data.")
+                
+                # Set up the optimization problem with cvxpy
+                p = cp.Variable(n_items)  # Item prices
+                lambda_reg = 0.1  # Regularization parameter
+                
+                # Objective: Minimize ||A @ p - c||^2 + lambda * ||p||^2
+                objective = cp.Minimize(cp.sum_squares(A @ p - c) + lambda_reg * cp.sum_squares(p))
+                
+                # Constraints: p >= 0
+                constraints = [p >= 0]
+                
+                # Add trade constraints as equality constraints
+                for trade in trades:
+                    give_idx = item_names.index(trade['give_item'])
+                    receive_idx = item_names.index(trade['receive_item'])
+                    # Constraint: give_quantity * p[give_item] = receive_quantity * p[receive_item]
+                    constraints.append(trade['give_quantity'] * p[give_idx] == trade['receive_quantity'] * p[receive_idx])
+                
+                # Solve the problem
+                problem = cp.Problem(objective, constraints)
+                try:
+                    problem.solve()
+                    if problem.status != cp.OPTIMAL:
+                        st.warning("Optimization did not converge to an optimal solution. Results may be unreliable.")
+                    p_values = p.value
+                except Exception as e:
+                    st.error(f"Optimization failed: {str(e)}. Falling back to bundle data only.")
+                    p_values = None
+                
+                # If optimization fails or no trades, fall back to regularized NNLS
+                if p_values is None:
+                    from scipy.optimize import nnls
+                    A_reg = np.vstack([A, np.sqrt(lambda_reg) * np.eye(n_items)])
+                    c_reg = np.concatenate([c, np.zeros(n_items)])
+                    p_values, _ = nnls(A_reg, c_reg)
+                
+                # Normalize prices to better match total bundle costs
+                predicted_costs = A @ p_values
+                nonzero_mask = predicted_costs > 0
+                if np.any(nonzero_mask):
+                    scaling_factor = np.mean(c[nonzero_mask] / predicted_costs[nonzero_mask])
+                    p_values = p_values * scaling_factor
+                
+                # Check for negative prices and warn the user
+                if any(price < 0 for price in p_values):
+                    st.warning("Some items have negative estimated prices, which should not happen. This may indicate numerical instability or an issue with the dataset.")
                 
                 # Function to format price based on its value
                 def format_price(price, item_name):
@@ -115,67 +114,78 @@ if bundle_file is not None:
                     else:
                         return f"${price:.2f}"
                 
-                st.write(f"Estimated price of {selected_item}: {format_price(p_i, selected_item)}")
+                # Create tabs
+                tab1, tab2 = st.tabs(["Bundle Analysis", "Item Prices"])
                 
-                # Warn if the estimated price is zero
-                if p_i == 0:
-                    st.warning(f"The estimated price of {selected_item} is $0.00. This may indicate insufficient data variation to accurately estimate the price, leading to unreliable results.")
-                
-                # Filter bundles with the selected item
-                bundles_with_item = df_bundle[df_bundle[selected_item] > 0].copy()
-                
-                if not bundles_with_item.empty:
-                    # Calculate bundle metrics
-                    A_sub = bundles_with_item[item_names].values
-                    c_sub = bundles_with_item['cost'].values
-                    sum_all = A_sub @ p_mean  # Estimated total value
-                    sum_selected = bundles_with_item[selected_item] * p_i
-                    sum_other = sum_all - sum_selected
-                    effective_cost = c_sub - sum_other
-                    effective_cost_per_unit = effective_cost / bundles_with_item[selected_item]
-                    effective_units_per_dollar = 1 / effective_cost_per_unit
-                    value_relative_to_price = (sum_all / c_sub) * 100  # As percentage
+                # Tab 1: Bundle Analysis
+                with tab1:
+                    # Dropdown menu to select an item
+                    selected_item = st.selectbox("Select an item", item_names)
+                    p_i = p_values[item_names.index(selected_item)]  # Estimated price of the selected item
                     
-                    # Add to DataFrame
-                    bundles_with_item['effective_units_per_dollar'] = effective_units_per_dollar
-                    bundles_with_item['value_relative_to_price'] = value_relative_to_price
+                    # Display the estimated price with scaling if necessary
+                    st.write(f"Estimated price of {selected_item}: {format_price(p_i, selected_item)}")
                     
-                    # Sort by value
-                    sorted_bundles = bundles_with_item.sort_values('effective_units_per_dollar', ascending=False)
+                    # Warn if the estimated price is zero
+                    if p_i == 0:
+                        st.warning(f"The estimated price of {selected_item} is $0.00. This may indicate insufficient data variation to accurately estimate the price, leading to unreliable results.")
                     
-                    # Prepare display table
-                    display_df = sorted_bundles[['bundle_name', 'cost', selected_item, 'effective_units_per_dollar', 'value_relative_to_price']]
-                    display_df = display_df.rename(columns={
-                        'bundle_name': 'Bundle Name',
-                        'cost': 'Bundle Cost',
-                        selected_item: 'Quantity',
-                        'effective_units_per_dollar': 'Effective Units per $1',
-                        'value_relative_to_price': 'Value Relative to Price (%)'
-                    })
+                    # Filter bundles that contain the selected item
+                    bundles_with_item = df_bundles[df_bundles[selected_item] > 0].copy()
                     
-                    # Round for readability
-                    display_df['Effective Units per $1'] = display_df['Effective Units per $1'].round(2)
-                    display_df['Value Relative to Price (%)'] = display_df['Value Relative to Price (%)'].round(2)
-                    
-                    st.dataframe(display_df)
-                else:
-                    st.write("No bundles contain this item.")
-            
-            # Tab 2: Item Prices
-            with tab2:
-                # Create a DataFrame for item prices with scaled prices
-                item_price_data = []
-                for item, price in zip(item_names, p_mean):
-                    if price < 0.001:
-                        scaled_price = price * 1000
-                        display_price = f"${scaled_price:.2f} (1k)"
-                    elif price < 0.01:
-                        scaled_price = price * 100
-                        display_price = f"${scaled_price:.2f} (100)"
+                    if not bundles_with_item.empty:
+                        # Compute effective cost per unit for the selected item in each bundle
+                        A_sub = bundles_with_item[item_names].values
+                        c_sub = bundles_with_item['cost'].values
+                        sum_all = A_sub @ p_values  # Total estimated cost of all items in each bundle
+                        sum_selected = bundles_with_item[selected_item] * p_i  # Estimated cost of selected item
+                        sum_other = sum_all - sum_selected  # Estimated cost of other items
+                        effective_cost = c_sub - sum_other  # Effective cost of selected item
+                        effective_cost_per_unit = effective_cost / bundles_with_item[selected_item]
+                        
+                        # Calculate effective units per $1 (reciprocal of effective cost per unit)
+                        effective_units_per_dollar = 1 / effective_cost_per_unit
+                        
+                        # Add effective units per $1 to the DataFrame
+                        bundles_with_item['effective_units_per_dollar'] = effective_units_per_dollar
+                        
+                        # Sort bundles by effective units per dollar (descending = best value first)
+                        sorted_bundles = bundles_with_item.sort_values('effective_units_per_dollar', ascending=False)
+                        
+                        # Prepare display DataFrame with renamed columns for clarity
+                        display_df = sorted_bundles[['bundle_name', 'cost', selected_item, 'effective_units_per_dollar']]
+                        display_df = display_df.rename(columns={
+                            'bundle_name': 'Bundle Name',
+                            'cost': 'Bundle Cost',
+                            selected_item: 'Quantity',
+                            'effective_units_per_dollar': 'Effective Units per $1'
+                        })
+                        
+                        # Round the effective units per $1 for better readability
+                        display_df['Effective Units per $1'] = display_df['Effective Units per $1'].round(2)
+                        
+                        # Display the sorted list of bundles
+                        st.dataframe(display_df)
                     else:
-                        scaled_price = price
-                        display_price = f"${scaled_price:.2f}"
-                    item_price_data.append({'Item': item, 'Estimated Price ($)': display_price})
+                        st.write("No bundles contain this item.")
                 
-                item_price_df = pd.DataFrame(item_price_data)
-                st.dataframe(item_price_df, use_container_width=True)
+                # Tab 2: Item Prices
+                with tab2:
+                    # Create a DataFrame for item prices with scaled prices
+                    item_price_data = []
+                    for item, price in zip(item_names, p_values):
+                        if price < 0.001:
+                            scaled_price = price * 1000
+                            display_price = f"${scaled_price:.2f} (1k)"
+                        elif price < 0.01:
+                            scaled_price = price * 100
+                            display_price = f"${scaled_price:.2f} (100)"
+                        else:
+                            scaled_price = price
+                            display_price = f"${scaled_price:.2f}"
+                        item_price_data.append({'Item': item, 'Estimated Price ($)': display_price})
+                    
+                    item_price_df = pd.DataFrame(item_price_data)
+                    
+                    # Display a sortable table of items and their estimated prices
+                    st.dataframe(item_price_df, use_container_width=True)
