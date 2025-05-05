@@ -66,7 +66,7 @@ if uploaded_file is not None:
                 # Set up the optimization problem with cvxpy
                 p = cp.Variable(n_items)  # Item prices (scaled)
                 lambda_reg = 0.1  # Regularization parameter
-                lambda_trade = 1.0  # Trade constraint penalty
+                lambda_trade = 10.0  # Increased trade constraint penalty
                 
                 # Objective: ||A @ p - c||^2 + lambda_reg * ||p||^2
                 objective = cp.sum_squares(A_scaled @ p - c) + lambda_reg * cp.sum_squares(p)
@@ -86,8 +86,9 @@ if uploaded_file is not None:
                     if trade_penalties:
                         objective += lambda_trade * cp.sum(trade_penalties)
                 
-                # Constraints: p >= 0
-                constraints = [p >= 0]
+                # Constraints: p >= min_price
+                min_price = 1e-6
+                constraints = [p >= min_price]
                 
                 # Solve the problem
                 problem = cp.Problem(cp.Minimize(objective), constraints)
@@ -110,8 +111,8 @@ if uploaded_file is not None:
                     A_reg = np.vstack([A_scaled, np.sqrt(lambda_reg) * np.eye(n_items)])
                     c_reg = np.concatenate([c, np.zeros(n_items)])
                     p_values, _ = nnls(A_reg, c_reg)
-                    # NNLS ensures non-negative values, but clip for consistency
-                    p_values = np.maximum(p_values, 0)
+                    # Apply minimum price constraint
+                    p_values = np.maximum(p_values, min_price)
                 
                 # Rescale the prices
                 p_values = p_values * p_scaling
@@ -150,8 +151,8 @@ if uploaded_file is not None:
                     # Display the estimated price with scaling if necessary
                     st.write(f"Estimated price of {selected_item}: {format_price(p_i, selected_item)}")
                     
-                    # Warn if the estimated price is very close to zero
-                    if p_i < 1e-6:
+                    # Warn if the estimated price is very close to min_price
+                    if p_i < 2 * min_price:
                         st.warning(f"The estimated price of {selected_item} is effectively $0.00. This may indicate insufficient data to accurately estimate the price.")
                     
                     # Filter bundles that contain the selected item
@@ -170,23 +171,29 @@ if uploaded_file is not None:
                         # Calculate effective units per $1 (reciprocal of effective cost per unit)
                         effective_units_per_dollar = 1 / effective_cost_per_unit
                         
-                        # Add effective units per $1 to the DataFrame
+                        # Calculate value relative to price
+                        value_relative_to_price = (sum_all / c_sub) * 100  # As percentage
+                        
+                        # Add to DataFrame
                         bundles_with_item['effective_units_per_dollar'] = effective_units_per_dollar
+                        bundles_with_item['value_relative_to_price'] = value_relative_to_price
                         
                         # Sort bundles by effective units per dollar (descending = best value first)
                         sorted_bundles = bundles_with_item.sort_values('effective_units_per_dollar', ascending=False)
                         
                         # Prepare display DataFrame with renamed columns for clarity
-                        display_df = sorted_bundles[['bundle_name', 'cost', selected_item, 'effective_units_per_dollar']]
+                        display_df = sorted_bundles[['bundle_name', 'cost', selected_item, 'effective_units_per_dollar', 'value_relative_to_price']]
                         display_df = display_df.rename(columns={
                             'bundle_name': 'Bundle Name',
                             'cost': 'Bundle Cost',
                             selected_item: 'Quantity',
-                            'effective_units_per_dollar': 'Effective Units per $1'
+                            'effective_units_per_dollar': 'Effective Units per $1',
+                            'value_relative_to_price': 'Value Relative to Price (%)'
                         })
                         
-                        # Round the effective units per $1 for better readability
+                        # Round for readability
                         display_df['Effective Units per $1'] = display_df['Effective Units per $1'].round(2)
+                        display_df['Value Relative to Price (%)'] = display_df['Value Relative to Price (%)'].round(2)
                         
                         # Display the sorted list of bundles
                         st.dataframe(display_df)
