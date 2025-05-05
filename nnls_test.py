@@ -38,6 +38,13 @@ if uploaded_file is not None:
                 c = df_bundles['cost'].values      # Vector of bundle costs
                 n_items = len(item_names)
                 
+                # Scale the quantities to improve numerical stability
+                scaling_factors = np.max(np.abs(A), axis=0)
+                scaling_factors[scaling_factors == 0] = 1  # Avoid division by zero
+                A_scaled = A / scaling_factors
+                c_scaled = c / np.max(np.abs(c))  # Scale costs as well
+                p_scaling = scaling_factors  # To rescale prices later
+                
                 # Read trade data from the second sheet, if it exists
                 trades = []
                 if len(sheet_names) > 1:
@@ -58,30 +65,31 @@ if uploaded_file is not None:
                                 st.warning(f"Trade involving {row['give_item']} or {row['receive_item']} ignored: Items not found in bundle data.")
                 
                 # Set up the Bayesian model with PyMC
-                with st.spinner("Sampling from the posterior..."):
+                with st.spinner("Fitting the model using variational inference..."):
                     with pm.Model() as model:
                         # Priors for item values
                         p = pm.HalfNormal('p', sigma=1.0, shape=n_items)
                         
                         # Likelihood for bundle prices
-                        expected_cost = pm.math.dot(A, p)
-                        sigma = pm.HalfNormal('sigma', sigma=1.0)
-                        pm.Normal('bundle_obs', mu=expected_cost, sigma=sigma, observed=c)
+                        expected_cost = pm.math.dot(A_scaled, p)
+                        sigma = pm.HalfNormal('sigma', sigma=0.1)
+                        pm.Normal('bundle_obs', mu=expected_cost, sigma=sigma, observed=c_scaled)
                         
                         # Add trade likelihoods
                         for trade in trades:
                             give_idx = item_names.index(trade['give_item'])
                             receive_idx = item_names.index(trade['receive_item'])
-                            give_qty = trade['give_quantity']
-                            receive_qty = trade['receive_quantity']
-                            trade_sigma = pm.HalfNormal(f'trade_sigma_{trade["give_item"]}_{trade["receive_item"]}', sigma=0.1)
+                            give_qty = trade['give_quantity'] / scaling_factors[give_idx]
+                            receive_qty = trade['receive_quantity'] / scaling_factors[receive_idx]
+                            trade_sigma = pm.HalfNormal(f'trade_sigma_{trade["give_item"]}_{trade["receive_item"]}', sigma=0.01)
                             pm.Normal(f'trade_obs_{trade["give_item"]}_{trade["receive_item"]}', mu=give_qty * p[give_idx] - receive_qty * p[receive_idx], sigma=trade_sigma, observed=0)
                         
-                        # Sample from the posterior
-                        trace = pm.sample(1000, tune=1000, return_inferencedata=True)
+                        # Use variational inference instead of MCMC
+                        approx = pm.fit(n=30000, method='advi', random_seed=42)
+                        p_mean = approx.mean.eval()  # Extract the mean of the variational posterior
                 
-                # Extract the mean prices from the posterior
-                p_mean = trace.posterior['p'].mean(dim=['chain', 'draw']).values
+                # Rescale the prices
+                p_mean = p_mean * p_scaling / np.max(np.abs(c)) * np.max(np.abs(c_scaled))
                 
                 # Function to format price based on its value
                 def format_price(price, item_name):
@@ -150,7 +158,7 @@ if uploaded_file is not None:
                         st.write("No bundles contain this item.")
                 
                 # Tab 2: Item Prices
-                with tab2:
+                with tab1:
                     # Create a DataFrame for item prices with scaled prices
                     item_price_data = []
                     for item, price in zip(item_names, p_mean):
