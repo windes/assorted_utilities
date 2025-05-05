@@ -1,9 +1,7 @@
 streamlit
 pandas
 numpy
-scipy
+openpyxl
 pymc
 arviz
-numba
-openpyxl
-cvxpy
+pytensor
