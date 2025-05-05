@@ -5,3 +5,5 @@ scipy
 pymc
 arviz
 numba
+openpyxl
+cvxpy
