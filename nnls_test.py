@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import cvxpy as cp
+import pymc as pm
 
 # Set the title of the Streamlit app
 st.title("Bundle Value Calculator")
@@ -33,7 +33,7 @@ if uploaded_file is not None:
             elif not all(df_bundles[col].dtype.kind in 'biufc' for col in item_names + ['cost']):
                 st.error("Item quantities and costs in bundle sheet must be numeric.")
             else:
-                # Prepare data for optimization
+                # Prepare data for Bayesian modeling
                 A = df_bundles[item_names].values  # Matrix of item quantities (bundles x items)
                 c = df_bundles['cost'].values      # Vector of bundle costs
                 n_items = len(item_names)
@@ -57,51 +57,31 @@ if uploaded_file is not None:
                             else:
                                 st.warning(f"Trade involving {row['give_item']} or {row['receive_item']} ignored: Items not found in bundle data.")
                 
-                # Set up the optimization problem with cvxpy
-                p = cp.Variable(n_items)  # Item prices
-                lambda_reg = 0.1  # Regularization parameter
+                # Set up the Bayesian model with PyMC
+                with st.spinner("Sampling from the posterior..."):
+                    with pm.Model() as model:
+                        # Priors for item values
+                        p = pm.HalfNormal('p', sigma=1.0, shape=n_items)
+                        
+                        # Likelihood for bundle prices
+                        expected_cost = pm.math.dot(A, p)
+                        sigma = pm.HalfNormal('sigma', sigma=1.0)
+                        pm.Normal('bundle_obs', mu=expected_cost, sigma=sigma, observed=c)
+                        
+                        # Add trade likelihoods
+                        for trade in trades:
+                            give_idx = item_names.index(trade['give_item'])
+                            receive_idx = item_names.index(trade['receive_item'])
+                            give_qty = trade['give_quantity']
+                            receive_qty = trade['receive_quantity']
+                            trade_sigma = pm.HalfNormal(f'trade_sigma_{trade["give_item"]}_{trade["receive_item"]}', sigma=0.1)
+                            pm.Normal(f'trade_obs_{trade["give_item"]}_{trade["receive_item"]}', mu=give_qty * p[give_idx] - receive_qty * p[receive_idx], sigma=trade_sigma, observed=0)
+                        
+                        # Sample from the posterior
+                        trace = pm.sample(1000, tune=1000, return_inferencedata=True)
                 
-                # Objective: Minimize ||A @ p - c||^2 + lambda * ||p||^2
-                objective = cp.Minimize(cp.sum_squares(A @ p - c) + lambda_reg * cp.sum_squares(p))
-                
-                # Constraints: p >= 0
-                constraints = [p >= 0]
-                
-                # Add trade constraints as equality constraints
-                for trade in trades:
-                    give_idx = item_names.index(trade['give_item'])
-                    receive_idx = item_names.index(trade['receive_item'])
-                    # Constraint: give_quantity * p[give_item] = receive_quantity * p[receive_item]
-                    constraints.append(trade['give_quantity'] * p[give_idx] == trade['receive_quantity'] * p[receive_idx])
-                
-                # Solve the problem
-                problem = cp.Problem(objective, constraints)
-                try:
-                    problem.solve()
-                    if problem.status != cp.OPTIMAL:
-                        st.warning("Optimization did not converge to an optimal solution. Results may be unreliable.")
-                    p_values = p.value
-                except Exception as e:
-                    st.error(f"Optimization failed: {str(e)}. Falling back to bundle data only.")
-                    p_values = None
-                
-                # If optimization fails or no trades, fall back to regularized NNLS
-                if p_values is None:
-                    from scipy.optimize import nnls
-                    A_reg = np.vstack([A, np.sqrt(lambda_reg) * np.eye(n_items)])
-                    c_reg = np.concatenate([c, np.zeros(n_items)])
-                    p_values, _ = nnls(A_reg, c_reg)
-                
-                # Normalize prices to better match total bundle costs
-                predicted_costs = A @ p_values
-                nonzero_mask = predicted_costs > 0
-                if np.any(nonzero_mask):
-                    scaling_factor = np.mean(c[nonzero_mask] / predicted_costs[nonzero_mask])
-                    p_values = p_values * scaling_factor
-                
-                # Check for negative prices and warn the user
-                if any(price < 0 for price in p_values):
-                    st.warning("Some items have negative estimated prices, which should not happen. This may indicate numerical instability or an issue with the dataset.")
+                # Extract the mean prices from the posterior
+                p_mean = trace.posterior['p'].mean(dim=['chain', 'draw']).values
                 
                 # Function to format price based on its value
                 def format_price(price, item_name):
@@ -115,20 +95,20 @@ if uploaded_file is not None:
                         return f"${price:.2f}"
                 
                 # Create tabs
-                tab1, tab2 = st.tabs(["Bundle Analysis", "Item Prices"])
+                tab1, tab2, tab3 = st.tabs(["Bundle Analysis", "Item Prices", "Bundle Breakdown"])
                 
                 # Tab 1: Bundle Analysis
                 with tab1:
                     # Dropdown menu to select an item
                     selected_item = st.selectbox("Select an item", item_names)
-                    p_i = p_values[item_names.index(selected_item)]  # Estimated price of the selected item
+                    p_i = p_mean[item_names.index(selected_item)]  # Estimated price of the selected item
                     
                     # Display the estimated price with scaling if necessary
                     st.write(f"Estimated price of {selected_item}: {format_price(p_i, selected_item)}")
                     
-                    # Warn if the estimated price is zero
-                    if p_i == 0:
-                        st.warning(f"The estimated price of {selected_item} is $0.00. This may indicate insufficient data variation to accurately estimate the price, leading to unreliable results.")
+                    # Warn if the estimated price is very close to zero
+                    if p_i < 1e-6:
+                        st.warning(f"The estimated price of {selected_item} is effectively $0.00. This may indicate insufficient data to accurately estimate the price.")
                     
                     # Filter bundles that contain the selected item
                     bundles_with_item = df_bundles[df_bundles[selected_item] > 0].copy()
@@ -137,7 +117,7 @@ if uploaded_file is not None:
                         # Compute effective cost per unit for the selected item in each bundle
                         A_sub = bundles_with_item[item_names].values
                         c_sub = bundles_with_item['cost'].values
-                        sum_all = A_sub @ p_values  # Total estimated cost of all items in each bundle
+                        sum_all = A_sub @ p_mean  # Total estimated cost of all items in each bundle
                         sum_selected = bundles_with_item[selected_item] * p_i  # Estimated cost of selected item
                         sum_other = sum_all - sum_selected  # Estimated cost of other items
                         effective_cost = c_sub - sum_other  # Effective cost of selected item
@@ -173,7 +153,7 @@ if uploaded_file is not None:
                 with tab2:
                     # Create a DataFrame for item prices with scaled prices
                     item_price_data = []
-                    for item, price in zip(item_names, p_values):
+                    for item, price in zip(item_names, p_mean):
                         if price < 0.001:
                             scaled_price = price * 1000
                             display_price = f"${scaled_price:.2f} (1k)"
@@ -189,3 +169,38 @@ if uploaded_file is not None:
                     
                     # Display a sortable table of items and their estimated prices
                     st.dataframe(item_price_df, use_container_width=True)
+                
+                # Tab 3: Bundle Breakdown
+                with tab3:
+                    bundle_names = df_bundles['bundle_name'].tolist()
+                    selected_bundle = st.selectbox("Select a bundle", bundle_names, key='bundle_select')
+                    bundle_row = df_bundles[df_bundles['bundle_name'] == selected_bundle].iloc[0]
+                    item_data = []
+                    total_estimated_value = 0
+                    for item in item_names:
+                        quantity = bundle_row[item]
+                        if quantity > 0:
+                            item_value = quantity * p_mean[item_names.index(item)]
+                            total_estimated_value += item_value
+                            item_data.append({
+                                'Item': item,
+                                'Quantity': quantity,
+                                'Fraction of Total Estimated Value': item_value / total_estimated_value if total_estimated_value > 0 else 0,
+                                'Estimated Value': item_value
+                            })
+                    if item_data:
+                        bundle_df = pd.DataFrame(item_data)
+                        bundle_df['Estimated Value'] = bundle_df['Estimated Value'].round(2)
+                        bundle_df['Fraction of Total Estimated Value'] = (bundle_df['Fraction of Total Estimated Value'] * 100).round(2).astype(str) + '%'
+                        st.dataframe(bundle_df)
+                        actual_price = bundle_row['cost']
+                        st.write(f"Total Estimated Value: ${total_estimated_value:.2f}")
+                        st.write(f"Actual Price: ${actual_price:.2f}")
+                        if total_estimated_value > actual_price:
+                            st.write("Good Deal")
+                        elif total_estimated_value < actual_price:
+                            st.write("Bad Deal")
+                        else:
+                            st.write("Fair Deal")
+                    else:
+                        st.write("This bundle has no items.")
